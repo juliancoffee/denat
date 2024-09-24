@@ -102,6 +102,7 @@ class ReUDP:
         self.s = s
         self.peer = self.first_peer_fetch()
         self.us_ok = False
+        self.end = False
 
         # state
         self.stats = Stats()
@@ -120,8 +121,10 @@ class ReUDP:
         return self
 
     def __exit__(self, *args, **kwargs):
+        self.end = True
         self.tick()
         self.stats.print_results()
+        # TODO: we should probably call disconnect() here as well
 
     def first_peer_fetch(self) -> Addr:
         return first_peer_fetch(
@@ -132,6 +135,9 @@ class ReUDP:
         )
 
     def try_to_reconnect(self) -> None:
+        if self.end:
+            return
+
         print("<> connection has failed, trying to reconnect")
         self.s = try_to_reconnect(
             self.s,
@@ -176,7 +182,6 @@ class ReUDP:
         _, peer = parse_server_msg(payload)
         print(f"new peer: {peer}")
         self.peer = peer
-        self.stats.remote()
 
     def handle_peer(self, payload: bytes) -> HandleResult:
         data = payload.decode('utf-8').split(":")
@@ -231,38 +236,44 @@ class ReUDP:
                 breakpoint()
                 raise RuntimeError(f"unexpected message: {payload!r}")
 
+    def check_messages(self) -> Optional[TickResult]:
+        if (res := timeout_recv(self.s, 0.15)) is not None:
+            payload, addr = res
+            if addr == self.remote:
+                self.handle_remote(payload)
+                self.stats.remote()
+                return None
+            elif addr == self.peer:
+                ret = self.handle_peer(payload)
+                register(self.stats, ret)
+
+                match ret:
+                    case TickResult.GotAck | TickResult.GotMsg:
+                        return ret
+                    case (
+                        TickResult.GotInitSyn
+                        | TickResult.GotInitAck
+                        | TickResult.Dup):
+                        return None
+                    case rest:
+                        assert_never_seq(rest)
+            else:
+                print(f"unknown {addr}: {payload!r}")
+                self.stats.other()
+                return None
+        else:
+            if not self.us_ok:
+                init_syn = self.syn_msg()
+                self.raw_send(init_syn)
+            self.stats.miss()
+            return None
+
     def tick(self, *, attempts: int = 10) -> TickResult:
         for _ in range(attempts):
-            if (res := timeout_recv(self.s, 0.15)) is not None:
-                payload, addr = res
-                if addr == self.remote:
-                    self.handle_remote(payload)
-                    continue
-                elif addr == self.peer:
-                    ret = self.handle_peer(payload)
-                    register(self.stats, ret)
-
-                    match ret:
-                        case TickResult.GotAck | TickResult.GotMsg:
-                            return ret
-                        case (
-                            TickResult.GotInitSyn
-                            | TickResult.GotInitAck
-                            | TickResult.Dup):
-                            continue
-                        case rest:
-                            assert_never_seq(rest)
-                else:
-                    print(f"unknown {addr}: {payload!r}")
-                    self.stats.other()
-
-            else:
-                if not self.us_ok:
-                    init_syn = self.syn_msg()
-                    self.raw_send(init_syn)
-                self.stats.miss()
-
+            ret = self.check_message()
             self.try_resend_lost()
+            if ret is not None:
+                return ret
         else:
             self.try_to_reconnect()
 
